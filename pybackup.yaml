@@ -1,0 +1,9 @@
+log: pybackup.log
+db: /tmp/pybackup.db
+split: 5
+backup:
+  - /etc
+  - /tmp
+exclude:
+  - ".git"
+  - "*bak"
