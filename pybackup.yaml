@@ -1,6 +1,7 @@
 log: pybackup.log
 db: /tmp/pybackup.db
 split: 5
+max_age: 300
 backup:
   - /tmp
 exclude:
