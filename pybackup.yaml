@@ -2,6 +2,13 @@ log: pybackup.log
 db: /tmp/pybackup.db
 split: 5
 max_age: 300
+exclude_flag: ".bkexclude"
+email:
+  server: smtp.online.no
+#  user: username
+#  password: top-secret
+  from: backup@mysystem.com
+  to: boss@mysystem.com
 backup:
   - /tmp
 exclude:
