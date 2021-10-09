@@ -29,16 +29,18 @@ split: 5
 max_age: 300
 exclude_flag: ".bkexclude"
 email:
-  server: localhost
-  subject: Result from pybackup
+    server: localhost
+    subject: Result from pybackup
 #  user: username
 #  password: top-secret
-from: backup@mysystem.com
-to: boss@mysystem.com
+    from: backup@mysystem.com
+    to: 
+        - boss@mysystem.com
 backup: []
 exclude: []
 resultT: |
   The counts are:
+  
      backed up files:{{ "%7d" | format(backed_up) }}
          incremental:{{ "%7d" | format(incremental) }}
     skipped 2 recent:{{ "%7d" | format(too_recent) }}
@@ -47,8 +49,68 @@ resultT: |
        skipped perm.:{{ "%7d" | format(permission) }}
               cyclic:{{ "%7d" | format(cyclic) }}
      removed from db:{{ "%7d" | format(removed) }}
+     
+  Errors:
+  {% for error in errors %}
+   {{ error }}
+  {% endfor %}
+  Messages:
+  {% for msg in msgs %}
+   {{ msg }}
+  {% endfor %}
 resultH: |
-  <html><body><h1>Hello world</h1>
+  <html>
+  <head>
+  <style>
+    table {
+        border-collapse: collapse; 
+        padding: 3px;
+        border: solid thin red;
+    }
+    table td {
+        border: solid thin red;
+        padding: 3px;
+    }
+    table .tl {
+        color: green;
+        text-align: right;
+    }
+    table .tr {
+        color: blue;
+        text-align: center;
+    }
+    ul.tar-errors li {
+        color: red;
+    }
+    ul.msg li {
+        color: green;
+    }
+  </style>
+  </head>
+  <body><h1>Pybackup results</h1>
+  <h2>Counts:</h2>
+  <table>
+    <tr><td class="tl">backed up files:</td><td class="tr">{{ backed_up }}</td></tr>
+    <tr><td class="tl">incremental:</td><td class="tr">{{ incremental }}</td></tr>
+    <tr><td class="tl">skipped 2 recent:</td><td class="tr">{{ too_recent }}</td></tr>
+    <tr><td class="tl">skipped as same:</td><td class="tr">{{ same_old }}</td></tr>
+    <tr><td class="tl">skipped flag:</td><td class="tr">{{ flagged_exc }}</td></tr>
+    <tr><td class="tl">skipped perm.:</td><td class="tr">{{ permission }}</td></tr>
+    <tr><td class="tl">cyclic:</td><td class="tr">{{ cyclic }}</td></tr>
+    <tr><td class="tl">removed from db:</td><td class="tr">{{ removed }}</td></tr>
+  </table>
+  <h2>Errors from tar:</h2>
+  <ul class="tar-errors">
+  {% for error in errors %}
+   <li>{{ error | escape }}</li>
+  {% endfor %}
+  </ul>
+  <h2>Messages:</h2>
+  <ul class="msg">
+  {% for msg in msgs %}
+   <li>{{ msg | escape }} </li>
+  {% endfor %}
+  </ul>
   </body></html>
 done: {}
 """
@@ -75,6 +137,7 @@ cnt_flagged_exc = 0
 cnt_backed_up = 0
 cnt_removed = 0
 error_list: list[str] = []
+msg_list: list[str] = []
 
 
 def prep_database():
@@ -258,6 +321,7 @@ def handle_finished():
 
 
 def handle_errors():
+    global error_list
     logging.debug('reading tar errors')
     while True:
         line = tar_proc.stderr.readline()
@@ -273,7 +337,7 @@ def main():
     """
     Use: pybackup <cfg-file> <target tar file>
     """
-    global db_conn, tar_proc, excludes, tar_file, cfg
+    global db_conn, tar_proc, excludes, tar_file, cfg, error_list, msg_list
     if len(sys.argv) < 3:
         print(main.__doc__)
         sys.exit(2)
@@ -306,7 +370,7 @@ def main():
         for row in db_conn.execute('select b.num,b.tarfile, count(f.name) from backup as b left join'
                                    + ' files as f on b.num=f.volume group by b.num'):
             if int(row[2]) == 0:
-                logging.info(f'tarfile {row[1]} from backup {row[0]} can be deleted')
+                msg_list.append(f'tarfile {row[1]} from backup {row[0]} can be deleted')
                 db_conn.execute('delete from backup where num=?', (row[0],))
                 db_conn.commit()
     results = {'backed_up': cnt_backed_up,
@@ -316,29 +380,46 @@ def main():
                'flagged_exc': cnt_flagged_exc,
                'permission': cnt_permission,
                'cyclic': cnt_cyclic,
-               'removed': cnt_removed
+               'removed': cnt_removed,
+               'errors': error_list,
+               'msgs': msg_list
                }
-    result_txt=cfg['resultT']
-    templ=jinja2.Template(result_txt)
-    result_txt=templ.render(results)
+    result_txt = cfg['resultT']
+    templ = jinja2.Template(result_txt)
+    result_txt = templ.render(results)
     print(result_txt)
-    result_html=cfg['resultH']
-    templ=jinja2.Template(result_html)
-    result_html=templ.render(results)
+    result_html = cfg['resultH']
+    with open('test.html','w') as outp:
+        print(result_html,file=outp)
+    templ = jinja2.Template(result_html)
+    result_html = templ.render(results)
+    with open('test.html','w') as outp:
+        print(result_html,file=outp)
     # emailing
-    msg = MIMEMultipart('alternative')
-    email = cfg['email']
-    msg['Subject'] = email['subject']
-    msg['From'] = email['from']
-    msg['To'] = email['to']
-    msg.attach(MIMEText(result_txt,'plain'))
-    msg.attach(MIMEText(result_html,'html'))
-    s=smtplib.SMTP(email['server'])
-    s.set_debuglevel(1)
-    if 'user' in email:
-        s.login(email['user'],email['password'])
-    s.sendmail(email['from'],email['to'],msg.as_string())
-    s.quit()
+    s=None
+    try:
+        logging.debug("starting emailing")
+        msg = MIMEMultipart('alternative')
+        email = cfg['email']
+        msg['Subject'] = email['subject']
+        msg['From'] = email['from']
+        recipients=email['to']
+        if isinstance(recipients, list):
+            msg['To'] = ",".join(recipients)
+        else:
+            msg['To'] = recipients
+        msg.attach(MIMEText(result_txt, 'plain'))
+        msg.attach(MIMEText(result_html, 'html'))
+        s = smtplib.SMTP(email['server'])
+        s.set_debuglevel(1)
+        if 'user' in email:
+            s.login(email['user'], email['password'])
+        s.sendmail(email['from'], recipients, msg.as_string())
+    except Exception as e:
+        logging.error("got an exception",e)
+    finally:
+        if s is not None:
+            s.quit()
     logging.debug("ended")
 
 
