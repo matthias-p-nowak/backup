@@ -1,6 +1,19 @@
 
-# backup
-Pybackup is cyclic backup controlled by a python script using tar as a subprocess.
+# Backup
+There are tape and disk based backup systems. 
+The former combines a bunch of files into an archive format, which traditionally has been written on a tape medium.
+The latter retrieves files from each client machine, discovers duplicates and stores the content on a server. 
+Moreover, it needs to ensure protection against corruption and dangers.
+
+The simplest form is tape based using tar/rmt. 
+Usually, a full backup is taken once in a while. 
+Then, files newer than the full backup (aka differential) or 
+    newer than the last backup (aka incremental) are saved into smaller archives.
+
+Pybackup is cyclic backup controlled by a python script using tar as a subprocess. 
+The first part is a incremental backup, the second phase is a partial full backup. 
+This means, it archives files which were least recently backed up.
+In order to achieve this, *Pybackup* uses a Sqlite database.
 
 ## How it works
 
