@@ -38,14 +38,13 @@ split: 5
 max_age: 300
 exclude_flag: ".bkexclude"
 email:
-#  server: smtp.online.no:578
-  server: localhost
-#  user: username
-#  password: top-secret
-#  from: backup@mysystem.com
-  from: me
-#  to: boss@mysystem.com
-  to: me
+  server: smtp.online.no:578
+  user: username
+  password: top-secret
+  from: backup@mysystem.com
+  to: 
+    - me
+    - root
 backup:
   - /tmp
 exclude:
