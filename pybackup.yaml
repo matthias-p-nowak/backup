@@ -4,11 +4,15 @@ split: 5
 max_age: 300
 exclude_flag: ".bkexclude"
 email:
-  server: smtp.online.no
+#  server: smtp.online.no:578
+  server: localhost
+  subject: Result from pybackup
 #  user: username
 #  password: top-secret
-  from: backup@mysystem.com
-  to: boss@mysystem.com
+#  from: backup@mysystem.com
+  from: me
+#  to: boss@mysystem.com
+  to: me
 backup:
   - /tmp
 exclude:
