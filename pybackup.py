@@ -7,14 +7,22 @@ import os
 import platform
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
+import threading
 import time
+from typing import BinaryIO
 
 import yaml
 from concurrent.futures.thread import ThreadPoolExecutor
 
 config = {}
+cnt_excluded = 0
+cnt_same_old = 0
+cnt2recent = 0
+cnt_permission = 0
+cnt_incremental = 0
 defaultCfg = """
 ---
 # default configuration
@@ -123,6 +131,15 @@ xz_proc: subprocess.Popen = None
 """xz subprocess"""
 error_list: list[str] = []
 msg_list: list[str] = []
+target_file: BinaryIO = None
+size_filled = False
+cur_size = 0
+target_size = 0
+blacklist = {}
+excluding = []
+start_device = 0
+max_age = 0
+tarring = set()
 
 
 def prep_database():
@@ -135,7 +152,7 @@ def prep_database():
         row = db_conn.execute('select max(version) from dbv').fetchone()
         if row is not None:
             version = row[0]
-    except:
+    except sqlite3.DatabaseError:
         logging.info('db has no version')
     if version == 0:
         logging.info("creating db from scratch")
@@ -156,45 +173,124 @@ def prep_database():
         vol_num = row[0] + 1
 
 
-def handle_finished():
-    pass
-
-
-def handle_tar_errors():
-    global error_list
+def handle_tar_stderr():
+    global error_list, tarring, tar_proc
     while True:
         line = tar_proc.stderr.readline()
         if not line:
-            break
+            return
         line = line.strip()
-        print(f"tar stderr {line}")
+        if line in tarring:
+            tarring.remove(line)
+        else:
+            print(f"tar stderr {line}")
+            error_list.append(line)
 
 
 def handle_enc_errors():
-    pass
+    global error_list, enc_proc
+    while True:
+        line = enc_proc.stderr.readline()
+        if not line:
+            return
+        line = line.strip()
+        print(f"enc stderr {line}")
+        error_list.append(line)
 
 
 def handle_xz_errors():
-    pass
+    global error_list, xz_proc
+    while True:
+        line = xz_proc.stderr.readline()
+        if not line:
+            return
+        line = line.strip()
+        print(f"enc stderr {line}")
+        error_list.append(line)
+
+
+def do_incremental(fullname):
+    global blacklist, cnt_excluded, excluding, config, start_device, \
+        cnt2recent, cnt_same_old, cnt_permission, cnt_incremental, tarring
+    for bl_item in blacklist:
+        if fullname.startswith(bl_item):
+            cnt_excluded += 1
+            return
+    for pattern in excluding:
+        m = pattern.search(fullname)
+        if m is not None:
+            cnt_excluded += 1
+            return
+    if fullname == config['db']:
+        return
+    if fullname == config['target']:
+        return
+    stat_buf = os.lstat(fullname)
+    if stat_buf.st_dev != start_device:
+        return
+    if stat.S_ISSOCK(stat_buf.st_mode):
+        return
+    mtime = int(stat_buf.st_mtime)
+    if mtime > max_age:
+        cnt2recent += 1
+        return
+    # checking age against database
+    row = db_conn.execute('select mtime from files where name=?', (fullname,)).fetchone()
+    if row is not None:
+        if row[0] == mtime:
+            # logging.debug('same old file: ' + fullname)
+            cnt_same_old += 1
+            return
+    if not os.access(fullname, os.R_OK):
+        logging.warning('missing permissions: ' + fullname)
+        cnt_permission += 1
+        return
+    # logging.debug(f'backing up: {fullname}')
+    cnt_incremental += 1
+    fullname = fullname[1:]
+    tarring.add(fullname)
+    print(fullname, file=tar_proc.stdin)
+    tar_proc.stdin.flush()
 
 
 def do_backup():
-    global tar_proc, config
-    excluding = []
-    blacklist = {}
+    global tar_proc, config, size_filled, blacklist, excluding, start_device, max_age, target_size
     try:
         for pattern in config['exclude']:
             comp_pattern = re.compile(pattern)
             excluding.append(comp_pattern)
         max_age = time.time() - config['min_age']
+        size_pat = re.compile('(\\d+)([kmgGM])')
+        m = size_pat.search(config['max_target_size'])
+        if m is not None:
+            s = int(m.group(1))
+            u = m.group(2)
+            if u == 'k':
+                s *= 1024
+            elif u == 'm' or u == 'M':
+                s *= 1024 * 1024
+            elif u == 'g' or u == 'G':
+                s *= 1024 * 1024 * 1024
+            target_size=s
+        else:
+            target_size = 500 * 1024 * 1024
         for entry in config['backup']:
+            if size_filled:
+                break
             stat_buf = os.lstat(entry)
             start_device = stat_buf.st_dev
             for path, dirs, files in os.walk(entry):
+                if size_filled:
+                    break
                 for item in files:
+                    if size_filled:
+                        break
                     if item == config['exclude_flag']:
                         blacklist[path] = True
-                        
+                        continue
+                    fullname = os.path.join(path, item)
+                    do_incremental(fullname)
+        # end of incremental backup
     except Exception as e:
         logging.error("exception", e)
         exit(2)
@@ -214,7 +310,7 @@ def main():
         -l <logfile> -- write to this logfile
         -t <target> -- write archive to this file
     """
-    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc
+    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file
     config = yaml.safe_load(defaultCfg)
     opts, arg = getopt.getopt(sys.argv[1:], 'c:t:l:dh')
     for opt, opt_arg in opts:
@@ -246,15 +342,14 @@ def main():
         prep_database()
         db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, target))
         db_conn.commit()
-        with open(target, 'wb') as target:
+        with open(target, 'wb') as target_file:
             tar_proc = subprocess.Popen(tar_args, cwd='/', stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE,
                                         encoding='UTF-8')
             enc_proc = subprocess.Popen(enc_args, stdin=tar_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            xz_proc = subprocess.Popen(xz_args, stdin=enc_proc.stdout, stdout=target, stderr=subprocess.PIPE)
+            xz_proc = subprocess.Popen(xz_args, stdin=enc_proc.stdout, stdout=target_file, stderr=subprocess.PIPE)
             with ThreadPoolExecutor(max_workers=7) as tpe:
-                tpe.submit(handle_finished)
-                tpe.submit(handle_tar_errors)
+                tpe.submit(handle_tar_stderr)
                 tpe.submit(handle_enc_errors)
                 tpe.submit(handle_xz_errors)
                 do_backup()
