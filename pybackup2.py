@@ -356,7 +356,6 @@ def main():
         excludes.append(cpt)
     with sqlite3.connect(cfg['db'], check_same_thread=False) as _dbcon:
         db_conn = _dbcon
-
         pcs = ['tar', '-cavf', tar_file, '-C', '/', '--no-recursion', '-T', '-']
         prep_database()
         db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, tar_file))

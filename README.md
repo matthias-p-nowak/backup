@@ -65,3 +65,8 @@ exclude:
   - "\\.git"
   - "bak$"
 ~~~
+
+Commands:
+* tar -cv -C / --no-recursion -T -
+* xz
+* gpg --symmetric --batch --cipher-algo AES256 --passphrase hello <t.out >t.enc
