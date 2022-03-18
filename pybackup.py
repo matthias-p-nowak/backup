@@ -25,7 +25,7 @@ cnt_permission = 0
 cnt_incremental = 0
 cnt_backed_up = 0
 cnt_removed = 0
-db_conn: sqlite3.Connection = None
+db_conn: sqlite3.Connection
 """Database connection """
 db_lock = threading.Lock()
 defaultCfg = """
@@ -127,22 +127,58 @@ done: {}
 error_list: list[str] = []
 vol_num = 0
 """current volume number"""
-tar_proc: subprocess.Popen = None
+tar_proc: subprocess.Popen
 """tar subprocess"""
-enc_proc: subprocess.Popen = None
+enc_proc: subprocess.Popen
 """gpg encryption process"""
-xz_proc: subprocess.Popen = None
+xz_proc: subprocess.Popen
 """xz subprocess"""
 msg_list: list[str] = []
-target_file: BinaryIO = None
-target_filename: str = None
-cur_size = 0
-target_size = 0
+target_file: BinaryIO
 blacklist = {}
 excluding = []
 start_device = 0
 max_age = 0
 tarring = set()
+
+
+class SizeCheck:
+    def __init__(self, size: str, fd: int):
+        self.fd = fd
+        self.size = 0
+        self.reserved = 0
+        size_pat = re.compile('(\\d+)([kmgGM])')
+        m = size_pat.search(size)
+        if m is not None:
+            s = int(m.group(1))
+            u = m.group(2)
+            if u == 'k':
+                s *= 1024
+            elif u == 'm' or u == 'M':
+                s *= 1024 * 1024
+            elif u == 'g' or u == 'G':
+                s *= 1024 * 1024 * 1024
+            self.target = s
+        else:
+            self.target = 500 * 1024 * 1024
+
+    def reserve(self, size: int):
+        if size + 512 + self.size + self.reserved >= self.target:
+            if self.reserved > 0:
+                ns = -1
+                while self.size != ns:
+                    self.size = ns
+                    time.sleep(1000)
+                    ns = os.fstat(self.fd).st_size
+                self.reserved = 0
+        if size + 512 + self.size + self.reserved < self.target:
+            self.reserved += size + 512
+            return True
+        else:
+            return False
+
+
+target_sc: SizeCheck
 
 
 def prep_database():
@@ -183,9 +219,9 @@ def handle_tar_stderr():
         if not line:
             return
         line = line.strip()
-        f2=line
+        f2 = line
         if f2.endswith(os.path.sep):
-            f2=f2[:-1]
+            f2 = f2[:-1]
         if f2 in tarring:
             tarring.remove(f2)
             line = os.path.sep + line
@@ -221,15 +257,6 @@ def handle_xz_errors():
         print(f"enc stderr {line}")
         error_list.append(line)
 
-
-def filled() -> bool:
-    global cur_size, target_size, target_file
-    stat_buf = os.fstat(target_file.fileno())
-    cur_size = stat_buf.st_size
-    if cur_size > target_size:
-        return True
-    return False
-
 def remove_file(fn: str):
     global db_conn, db_lock, cnt_removed
     with db_lock:
@@ -243,7 +270,7 @@ def remove_file(fn: str):
 
 def do_incremental(fullname):
     global blacklist, cnt_excluded, excluding, config, start_device, \
-        cnt2recent, cnt_same_old, cnt_permission, cnt_incremental, tarring
+        cnt2recent, cnt_same_old, cnt_permission, cnt_incremental, tarring, target_sc
     for bl_item in blacklist:
         if fullname.startswith(bl_item):
             cnt_excluded += 1
@@ -277,15 +304,18 @@ def do_incremental(fullname):
         logging.warning('missing permissions: ' + fullname)
         cnt_permission += 1
         return
-    # logging.debug(f'backing up: {fullname}')
-    cnt_incremental += 1
-    fullname = fullname[1:]
-    f2=fullname
-    if f2.endswith(os.path.sep):
-        f2=f2[:-1]
-    tarring.add(f2)
-    print(fullname, file=tar_proc.stdin)
-    tar_proc.stdin.flush()
+    if target_sc.reserve(stat_buf.st_size):
+        logging.debug(f"backing up: {fullname}")
+        cnt_incremental += 1
+        fullname = fullname[1:]
+        f2 = fullname
+        if f2.endswith(os.path.sep):
+            f2 = f2[:-1]
+        tarring.add(f2)
+        print(fullname, file=tar_proc.stdin)
+        tar_proc.stdin.flush()
+    else:
+        logging.debug(f"size too big for {fullname}")
 
 def do_cyclic(fn: str):
     global blacklist
@@ -296,26 +326,12 @@ def do_cyclic(fn: str):
 
 
 def do_backup():
-    global tar_proc, config, blacklist, excluding, start_device, max_age, target_size
+    global tar_proc, config, blacklist, excluding, start_device, max_age
     try:
         for pattern in config['exclude']:
             comp_pattern = re.compile(pattern)
             excluding.append(comp_pattern)
         max_age = time.time() - config['min_age']
-        size_pat = re.compile('(\\d+)([kmgGM])')
-        m = size_pat.search(config['max_target_size'])
-        if m is not None:
-            s = int(m.group(1))
-            u = m.group(2)
-            if u == 'k':
-                s *= 1024
-            elif u == 'm' or u == 'M':
-                s *= 1024 * 1024
-            elif u == 'g' or u == 'G':
-                s *= 1024 * 1024 * 1024
-            target_size = s
-        else:
-            target_size = 500 * 1024 * 1024
         # start incremental backup
         logging.debug('backing up new/changed files')
         for entry in config['backup']:
@@ -328,13 +344,9 @@ def do_backup():
                         continue
                     fullname = os.path.join(path, item)
                     do_incremental(fullname)
-                    if filled():
-                        return
                 for item in dirs:
                     fullname = os.path.join(path, item)
                     do_incremental(fullname)
-                    if filled():
-                        return
         # end incremental backup
         # start cyclic backup
         logging.debug('starting cycling backup')
@@ -344,8 +356,6 @@ def do_backup():
             if row is None:
                 return
             do_cyclic(row[0])
-            if not test_size(0):
-                return
         # end cyclic backup
     except Exception as e:
         logging.error("exception", e)
@@ -366,7 +376,7 @@ def main():
         -l <logfile> -- write to this logfile
         -t <target> -- write archive to this file
     """
-    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file, target_filename
+    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file
     config = yaml.safe_load(defaultCfg)
     opts, arg = getopt.getopt(sys.argv[1:], 'c:t:l:dh')
     for opt, opt_arg in opts:
@@ -390,15 +400,16 @@ def main():
     tar_args = ['tar', '-cv', '--no-recursion', '-T', '-']
     enc_args = ['gpg', '-c', '--symmetric', '--batch', '--cipher-algo', 'TWOFISH', '--passphrase', config['key']]
     xz_args = ['xz']
-    target_filename= config['target']
-    target_filename = target_filename.replace('%h', platform.node())
+    target_fn = config['target']
+    target_fn = target_fn.replace('%h', platform.node())
     dt = datetime.datetime.now()
-    target_filename = target_filename.replace('%t', dt.strftime('%y-%m-%d_%H-%M-%S'))
+    target_fn = target_fn.replace('%t', dt.strftime('%y-%m-%d_%H-%M-%S'))
     with sqlite3.connect(config['db'], check_same_thread=False) as db_conn:
         prep_database()
-        db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, target_filename))
+        db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, target_fn))
         db_conn.commit()
-        with open(target_filename, 'wb') as target_file:
+        with open(target_fn, 'wb') as target_file:
+            target_sc = SizeCheck(config['max_target_size'], target_file.fileno())
             tar_proc = subprocess.Popen(tar_args, cwd='/', stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE,
                                         encoding='UTF-8')
@@ -410,6 +421,7 @@ def main():
                 tpe.submit(handle_xz_errors)
                 do_backup()
         logging.debug('tar file closed')
+
 
 if __name__ == '__main__':
     print('pybackup started')
