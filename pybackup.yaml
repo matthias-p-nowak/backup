@@ -1,7 +1,7 @@
 log: pybackup.log
 db: /tmp/pybackup.db
 min_age: 300
-max_target_size: 500m
+max_target_size: 20M
 key: topsecret
 exclude_flag: ".bkexclude"
 email:

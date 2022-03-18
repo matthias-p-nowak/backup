@@ -12,10 +12,10 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures.thread import ThreadPoolExecutor
 from typing import BinaryIO
 
 import yaml
-from concurrent.futures.thread import ThreadPoolExecutor
 
 config = {}
 cnt_excluded = 0
@@ -23,6 +23,11 @@ cnt_same_old = 0
 cnt2recent = 0
 cnt_permission = 0
 cnt_incremental = 0
+cnt_backed_up = 0
+cnt_removed = 0
+db_conn: sqlite3.Connection = None
+"""Database connection """
+db_lock = threading.Lock()
 defaultCfg = """
 ---
 # default configuration
@@ -119,8 +124,7 @@ resultH: |
 done: {}
 """
 """configuration as a nested dictionary"""
-db_conn: sqlite3.Connection = None
-"""Database connection """
+error_list: list[str] = []
 vol_num = 0
 """current volume number"""
 tar_proc: subprocess.Popen = None
@@ -129,10 +133,9 @@ enc_proc: subprocess.Popen = None
 """gpg encryption process"""
 xz_proc: subprocess.Popen = None
 """xz subprocess"""
-error_list: list[str] = []
 msg_list: list[str] = []
 target_file: BinaryIO = None
-size_filled = False
+target_filename: str = None
 cur_size = 0
 target_size = 0
 blacklist = {}
@@ -174,14 +177,24 @@ def prep_database():
 
 
 def handle_tar_stderr():
-    global error_list, tarring, tar_proc
+    global error_list, tarring, tar_proc, db_lock, cnt_backed_up
     while True:
         line = tar_proc.stderr.readline()
         if not line:
             return
         line = line.strip()
-        if line in tarring:
-            tarring.remove(line)
+        f2=line
+        if f2.endswith(os.path.sep):
+            f2=f2[:-1]
+        if f2 in tarring:
+            tarring.remove(f2)
+            line = os.path.sep + line
+            statbuf = os.lstat(line)
+            mtime = int(statbuf.st_mtime)
+            with db_lock:
+                db_conn.execute('replace into files(name,mtime,volume) values(?,?,?)', (line, mtime, vol_num))
+                db_conn.commit()
+                cnt_backed_up += 1
         else:
             print(f"tar stderr {line}")
             error_list.append(line)
@@ -207,6 +220,25 @@ def handle_xz_errors():
         line = line.strip()
         print(f"enc stderr {line}")
         error_list.append(line)
+
+
+def filled() -> bool:
+    global cur_size, target_size, target_file
+    stat_buf = os.fstat(target_file.fileno())
+    cur_size = stat_buf.st_size
+    if cur_size > target_size:
+        return True
+    return False
+
+def remove_file(fn: str):
+    global db_conn, db_lock, cnt_removed
+    with db_lock:
+        try:
+            db_conn.execute('delete from files where name=?', (fn,))
+            db_conn.commit()
+            cnt_removed += 1
+        except Exception as ex:
+            logging.error(f'exception {ex}')
 
 
 def do_incremental(fullname):
@@ -248,13 +280,23 @@ def do_incremental(fullname):
     # logging.debug(f'backing up: {fullname}')
     cnt_incremental += 1
     fullname = fullname[1:]
-    tarring.add(fullname)
+    f2=fullname
+    if f2.endswith(os.path.sep):
+        f2=f2[:-1]
+    tarring.add(f2)
     print(fullname, file=tar_proc.stdin)
     tar_proc.stdin.flush()
 
+def do_cyclic(fn: str):
+    global blacklist
+    try:
+        stat_buf = os.lstat(fn)
+    except FileNotFoundError:
+        remove_file(fn)
+
 
 def do_backup():
-    global tar_proc, config, size_filled, blacklist, excluding, start_device, max_age, target_size
+    global tar_proc, config, blacklist, excluding, start_device, max_age, target_size
     try:
         for pattern in config['exclude']:
             comp_pattern = re.compile(pattern)
@@ -271,26 +313,40 @@ def do_backup():
                 s *= 1024 * 1024
             elif u == 'g' or u == 'G':
                 s *= 1024 * 1024 * 1024
-            target_size=s
+            target_size = s
         else:
             target_size = 500 * 1024 * 1024
+        # start incremental backup
+        logging.debug('backing up new/changed files')
         for entry in config['backup']:
-            if size_filled:
-                break
             stat_buf = os.lstat(entry)
             start_device = stat_buf.st_dev
             for path, dirs, files in os.walk(entry):
-                if size_filled:
-                    break
                 for item in files:
-                    if size_filled:
-                        break
                     if item == config['exclude_flag']:
                         blacklist[path] = True
                         continue
                     fullname = os.path.join(path, item)
                     do_incremental(fullname)
-        # end of incremental backup
+                    if filled():
+                        return
+                for item in dirs:
+                    fullname = os.path.join(path, item)
+                    do_incremental(fullname)
+                    if filled():
+                        return
+        # end incremental backup
+        # start cyclic backup
+        logging.debug('starting cycling backup')
+        rs = db_conn.execute('select name, volume  from files order by volume ASC')
+        while True:
+            row = rs.fetchone()
+            if row is None:
+                return
+            do_cyclic(row[0])
+            if not test_size(0):
+                return
+        # end cyclic backup
     except Exception as e:
         logging.error("exception", e)
         exit(2)
@@ -310,7 +366,7 @@ def main():
         -l <logfile> -- write to this logfile
         -t <target> -- write archive to this file
     """
-    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file
+    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file, target_filename
     config = yaml.safe_load(defaultCfg)
     opts, arg = getopt.getopt(sys.argv[1:], 'c:t:l:dh')
     for opt, opt_arg in opts:
@@ -334,15 +390,15 @@ def main():
     tar_args = ['tar', '-cv', '--no-recursion', '-T', '-']
     enc_args = ['gpg', '-c', '--symmetric', '--batch', '--cipher-algo', 'TWOFISH', '--passphrase', config['key']]
     xz_args = ['xz']
-    target: str = config['target']
-    target = target.replace('%h', platform.node())
+    target_filename= config['target']
+    target_filename = target_filename.replace('%h', platform.node())
     dt = datetime.datetime.now()
-    target = target.replace('%t', dt.strftime('%y-%m-%d_%H-%M-%S'))
+    target_filename = target_filename.replace('%t', dt.strftime('%y-%m-%d_%H-%M-%S'))
     with sqlite3.connect(config['db'], check_same_thread=False) as db_conn:
         prep_database()
-        db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, target))
+        db_conn.execute('insert into backup(num,tarfile) values(?,?)', (vol_num, target_filename))
         db_conn.commit()
-        with open(target, 'wb') as target_file:
+        with open(target_filename, 'wb') as target_file:
             tar_proc = subprocess.Popen(tar_args, cwd='/', stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE,
                                         encoding='UTF-8')
@@ -353,7 +409,7 @@ def main():
                 tpe.submit(handle_enc_errors)
                 tpe.submit(handle_xz_errors)
                 do_backup()
-
+        logging.debug('tar file closed')
 
 if __name__ == '__main__':
     print('pybackup started')
