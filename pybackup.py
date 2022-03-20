@@ -1,4 +1,4 @@
-#!/bin/env python3
+#!/bin/env python3.9
 import atexit
 import datetime
 import getopt
@@ -17,6 +17,8 @@ from typing import BinaryIO
 
 import yaml
 
+KILO = 1000
+HEADER_SZ = 512
 config = {}
 cnt_excluded = 0
 cnt_same_old = 0
@@ -35,6 +37,7 @@ log: pybackup.log
 db: /tmp/pybackup.db
 min_age: 300
 max_target_size: 500m
+target: /tmp/backup-%h-%t.tar.enc.xz
 key: topsecret
 exclude_flag: ".bkexclude"
 email:
@@ -140,12 +143,12 @@ excluding = []
 start_device = 0
 max_age = 0
 tarring = set()
+set_lock = threading.Lock()
 
 
 class SizeCheck:
     def __init__(self, size: str, fd: int):
         self.fd = fd
-        self.size = 0
         self.reserved = 0
         size_pat = re.compile('(\\d+)([kmgGM])')
         m = size_pat.search(size)
@@ -153,29 +156,26 @@ class SizeCheck:
             s = int(m.group(1))
             u = m.group(2)
             if u == 'k':
-                s *= 1024
+                s *= KILO
             elif u == 'm' or u == 'M':
-                s *= 1024 * 1024
+                s *= KILO * KILO
             elif u == 'g' or u == 'G':
-                s *= 1024 * 1024 * 1024
+                s *= KILO * KILO * KILO
             self.target = s
         else:
-            self.target = 500 * 1024 * 1024
+            self.target = 500 * KILO * KILO
 
     def reserve(self, size: int):
-        if size + 512 + self.size + self.reserved >= self.target:
-            if self.reserved > 0:
-                ns = -1
-                while self.size != ns:
-                    self.size = ns
-                    time.sleep(1000)
-                    ns = os.fstat(self.fd).st_size
-                self.reserved = 0
-        if size + 512 + self.size + self.reserved < self.target:
-            self.reserved += size + 512
-            return True
-        else:
+        nsz = size + HEADER_SZ + self.reserved
+        if nsz >= self.target:
             return False
+        self.reserved += size + HEADER_SZ
+        return True
+
+    def is_filled(self):
+        if self.reserved >= self.target:
+            return True
+        return False
 
 
 target_sc: SizeCheck
@@ -213,17 +213,20 @@ def prep_database():
 
 
 def handle_tar_stderr():
-    global error_list, tarring, tar_proc, db_lock, cnt_backed_up
+    global error_list, tarring, tar_proc, db_lock, cnt_backed_up, set_lock
     while True:
         line = tar_proc.stderr.readline()
         if not line:
             return
         line = line.strip()
         f2 = line
-        if f2.endswith(os.path.sep):
+        while f2.endswith('/'):
             f2 = f2[:-1]
-        if f2 in tarring:
-            tarring.remove(f2)
+        with set_lock:
+            found = f2 in tarring
+        if found:
+            with set_lock:
+                tarring.remove(f2)
             line = os.path.sep + line
             statbuf = os.lstat(line)
             mtime = int(statbuf.st_mtime)
@@ -243,6 +246,8 @@ def handle_enc_errors():
         if not line:
             return
         line = line.strip()
+        if len(line) == 0:
+            return
         print(f"enc stderr {line}")
         error_list.append(line)
 
@@ -254,8 +259,12 @@ def handle_xz_errors():
         if not line:
             return
         line = line.strip()
+        if len(line) == 0:
+            return
+
         print(f"enc stderr {line}")
         error_list.append(line)
+
 
 def remove_file(fn: str):
     global db_conn, db_lock, cnt_removed
@@ -270,7 +279,7 @@ def remove_file(fn: str):
 
 def do_incremental(fullname):
     global blacklist, cnt_excluded, excluding, config, start_device, \
-        cnt2recent, cnt_same_old, cnt_permission, cnt_incremental, tarring, target_sc
+        cnt2recent, cnt_same_old, cnt_permission, cnt_incremental, tarring, target_sc, set_lock
     for bl_item in blacklist:
         if fullname.startswith(bl_item):
             cnt_excluded += 1
@@ -293,6 +302,8 @@ def do_incremental(fullname):
     if mtime > max_age:
         cnt2recent += 1
         return
+    if stat.S_ISDIR(stat_buf.st_mode):
+        fullname += '/'
     # checking age against database
     row = db_conn.execute('select mtime from files where name=?', (fullname,)).fetchone()
     if row is not None:
@@ -307,26 +318,55 @@ def do_incremental(fullname):
     if target_sc.reserve(stat_buf.st_size):
         logging.debug(f"backing up: {fullname}")
         cnt_incremental += 1
+        # no starting '/'
         fullname = fullname[1:]
         f2 = fullname
-        if f2.endswith(os.path.sep):
+        # no ending '/'
+        while f2.endswith('/'):
             f2 = f2[:-1]
-        tarring.add(f2)
+        with set_lock:
+            tarring.add(f2)
         print(fullname, file=tar_proc.stdin)
         tar_proc.stdin.flush()
     else:
         logging.debug(f"size too big for {fullname}")
 
-def do_cyclic(fn: str):
-    global blacklist
+
+def do_cyclic(fullname: str):
+    global blacklist, excluding, tarring, tar_proc, target_sc, set_lock
     try:
-        stat_buf = os.lstat(fn)
+        for bl_item in blacklist:
+            if fullname.startswith(bl_item):
+                remove_file(fullname)
+                return
+        for pattern in excluding:
+            m = pattern.search(fullname)
+            if m is not None:
+                remove_file(fullname)
+                return
+        stat_buf = os.lstat(fullname)
+        if stat.S_ISSOCK(stat_buf.st_mode):
+            return
+        mtime = int(stat_buf.st_mtime)
+        if mtime > max_age:
+            remove_file(fullname)
+            return
+        if target_sc.reserve(stat_buf.st_size):
+            logging.debug(f"backing up {fullname} {len(tarring)}")
+            fullname = fullname[1:]
+            f2 = fullname
+            while f2.endswith(os.path.sep):
+                f2 = f2[:-1]
+            with set_lock:
+                tarring.add(f2)
+            print(fullname, file=tar_proc.stdin)
+            tar_proc.stdin.flush()
     except FileNotFoundError:
-        remove_file(fn)
+        remove_file(fullname)
 
 
 def do_backup():
-    global tar_proc, config, blacklist, excluding, start_device, max_age
+    global tar_proc, config, blacklist, excluding, start_device, max_age, target_sc, tarring, vol_num
     try:
         for pattern in config['exclude']:
             comp_pattern = re.compile(pattern)
@@ -344,24 +384,30 @@ def do_backup():
                         continue
                     fullname = os.path.join(path, item)
                     do_incremental(fullname)
+                    if target_sc.is_filled():
+                        return
                 for item in dirs:
                     fullname = os.path.join(path, item)
                     do_incremental(fullname)
+                    if target_sc.is_filled():
+                        return
         # end incremental backup
         # start cyclic backup
         logging.debug('starting cycling backup')
-        rs = db_conn.execute('select name, volume  from files order by volume ASC')
+        rs = db_conn.execute('select name, volume  from files where volume < ? order by volume ASC', (vol_num,))
         while True:
             row = rs.fetchone()
             if row is None:
                 return
             do_cyclic(row[0])
+            if target_sc.is_filled():
+                return
         # end cyclic backup
     except Exception as e:
         logging.error("exception", e)
         exit(2)
     finally:
-        logging.debug("closing tar input")
+        logging.debug(f"closing tar input - {len(tarring)} unfinished")
         tar_proc.stdin.close()
 
 
@@ -374,11 +420,12 @@ def main():
         -h -- display help
         -k -- set encryption key
         -l <logfile> -- write to this logfile
+        -s <size> -- size of the archive file at max (<number>{k,m,M,g,G})
         -t <target> -- write archive to this file
     """
-    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file
+    global config, defaultCfg, db_conn, tar_proc, enc_proc, xz_proc, target_file, target_sc
     config = yaml.safe_load(defaultCfg)
-    opts, arg = getopt.getopt(sys.argv[1:], 'c:t:l:dh')
+    opts, arg = getopt.getopt(sys.argv[1:], 'c:t:l:dhs:')
     for opt, opt_arg in opts:
         if opt == '-c':
             with open(opt_arg) as cf:
@@ -392,6 +439,8 @@ def main():
             config['key'] = opt_arg
         elif opt == '-l':
             config['log'] = opt_arg
+        elif opt == '-s':
+            config['max_target_size'] = opt_arg
         elif opt == '-t':
             config['target'] = opt_arg
     logging.basicConfig(filename=config['log'], level=logging.DEBUG, filemode='w',
@@ -399,7 +448,7 @@ def main():
     logging.debug("pybackup started")
     tar_args = ['tar', '-cv', '--no-recursion', '-T', '-']
     enc_args = ['gpg', '-c', '--symmetric', '--batch', '--cipher-algo', 'TWOFISH', '--passphrase', config['key']]
-    xz_args = ['xz']
+    xz_args = ['xz', '-9']
     target_fn = config['target']
     target_fn = target_fn.replace('%h', platform.node())
     dt = datetime.datetime.now()
