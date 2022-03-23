@@ -1,3 +1,9 @@
+# Disclaimer
+
+The first pipe between the python program and tar failed. 
+When one closes the pipe even after flushing, the tar program exits immediately. 
+
+Replaced by "cyclic backup".
 
 # Backup
 There are tape and disk based backup systems. 
